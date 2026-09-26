@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -41,13 +42,20 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "vn_phone": r"\b0\d{9,10}\b",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        # Số ID phải có ngữ cảnh. Bắt \b\d{9}\b trần sẽ redact cả số tiền
+        # "500000000" trong câu banking hợp lệ → false positive.
+        "national_id": r"(?:cccd|cmnd|can cuoc|căn cước|national id|id number)\D{0,15}\d{9,12}",
+        "api_key": r"sk-[a-zA-Z0-9_-]+",
+        # Hint gốc chỉ có [:=], nhưng model trả lời kiểu "password is admin123".
+        "password": r"password\s*(?:is|:|=)\s*\S+",
+        "db_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?",
     }
+    if DEMO_SECRETS:
+        PII_PATTERNS["protected_secret"] = "|".join(
+            re.escape(needle) for needle in DEMO_SECRETS
+        )
 
     for name, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
@@ -149,6 +157,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +181,30 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        def _replace(text: str) -> None:
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_issues = result["issues"]
+            _replace(result["redacted"])
+        else:
+            self.last_issues = []
+
+        # Judge tự vô hiệu khi safety_judge_agent is None (optional, không chấm).
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict.get("safe", True):
+                self.blocked_count += 1
+                _replace(
+                    "Xin lỗi, tôi không thể trả lời nội dung này. "
+                    "Vui lòng liên hệ tổng đài VinBank để được hỗ trợ."
+                )
+
+        return llm_response
 
 
 # ============================================================

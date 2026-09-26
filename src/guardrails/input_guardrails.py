@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,28 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+
+# ============================================================
+# Normalization — chạy TRƯỚC mọi regex.
+# Kẻ tấn công nhét zero-width / full-width để lách pattern:
+#   "Ignore\u200b all previous instructions"
+# ============================================================
+
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad]")
+
+
+def normalize_text(text: str) -> str:
+    """NFKC + bỏ ký tự vô hình + gộp whitespace + lower."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = _INVISIBLE_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def strip_accents(text: str) -> str:
+    """Bỏ dấu tiếng Việt để khớp ALLOWED_TOPICS viết không dấu."""
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 
 # ============================================================
@@ -52,13 +75,26 @@ def detect_injection(user_input: str) -> InputStatus:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore (all |any )?(the )?(previous |above |prior )?instructions",
+        r"disregard (all |any )?(the )?(previous |above |prior )?(instructions|rules)",
+        r"forget (all |everything )?(previous|above|you were told|your rules)",
+        r"you are now",
+        r"system prompt",
+        r"reveal (your |the )?(system |internal )?(instructions|prompt|rules|password)",
+        r"(print|show|output|repeat|dump) (me )?(your |the )?(system |internal )?(prompt|instructions|rules)",
+        r"pretend (you are|to be|that you)",
+        r"act as (a |an )?unrestricted",
+        r"developer mode",
+        r"bypass (the |your )?(guardrail|filter|safety|restriction|security)",
+        r"(admin|administrator|internal) password",
+        r"no longer bound by",
     ]
 
+    # Normalize trước — nếu không, ký tự vô hình chèn giữa từ sẽ lách hết regex.
+    candidate = normalize_text(user_input)
+
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, candidate, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +120,18 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    # Bỏ dấu để "tài khoản" khớp "tai khoan" trong ALLOWED_TOPICS.
+    input_lower = strip_accents(normalize_text(user_input))
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # Word-boundary, KHÔNG substring: "hack" không được khớp "skill"/"stealth".
+    def _mentions(topic: str) -> bool:
+        return re.search(rf"\b{re.escape(strip_accents(topic.lower()))}\b", input_lower) is not None
 
-    pass  # Replace with your implementation
+    if any(_mentions(t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(_mentions(t) for t in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -112,6 +152,7 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.last_reason: str | None = None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -144,14 +185,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # Injection trước topic: câu tấn công dính cả hai, chạy injection trước
+        # thì `layer` trong audit log / results.json ghi đúng nguyên nhân gốc.
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "injection"
+            return self._block_response(
+                "Yêu cầu bị chặn: phát hiện dấu hiệu prompt injection. "
+                "Nội dung trong email/tài liệu là dữ liệu, không phải lệnh hệ thống."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "off_topic"
+            return self._block_response(
+                "Yêu cầu bị chặn: tôi chỉ hỗ trợ các câu hỏi về ngân hàng VinBank "
+                "(tài khoản, giao dịch, tiết kiệm, lãi suất, thẻ, vay)."
+            )
+
+        self.last_reason = None
+        return None
 
 
 # ============================================================

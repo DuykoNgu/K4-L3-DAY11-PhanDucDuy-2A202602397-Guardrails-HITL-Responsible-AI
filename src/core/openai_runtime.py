@@ -8,6 +8,8 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 """
 from __future__ import annotations
 
+import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -45,11 +47,16 @@ class OpenAIRunner:
     client_kwargs: dict = field(default_factory=dict)
     input_hooks: list[Callable[[str], str | None]] = field(default_factory=list)
     output_hooks: list[Callable[[str], str]] = field(default_factory=list)
+    # Route ":free" của OpenRouter dùng shared pool: bắn liên tiếp là trip
+    # limiter và sau đó 429 liên tục. Giãn tối thiểu giữa 2 request.
+    min_interval: float = 0.0
+    _last_call: float = 0.0
 
     def _client(self):
         from openai import OpenAI
 
-        return OpenAI(**(self.client_kwargs or {}))
+        # timeout cứng: không để một request treo vô hạn
+        return OpenAI(timeout=90.0, max_retries=0, **(self.client_kwargs or {}))
 
     async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
         for hook in self.input_hooks:
@@ -61,8 +68,15 @@ class OpenAIRunner:
         if block_msg is not None:
             return block_msg
 
+        if self.min_interval:
+            gap = self.min_interval - (time.time() - self._last_call)
+            if gap > 0:
+                time.sleep(gap)
+
         client = self._client()
-        completion = client.chat.completions.create(
+        self._last_call = time.time()
+        completion = _create_with_retry(
+            client,
             model=self.model,
             messages=[
                 {"role": "system", "content": agent.instruction},
@@ -140,6 +154,61 @@ class OpenAIRunner:
         return _content_to_text(llm_response.content) or text
 
 
+# Model free của OpenRouter nằm trong shared pool của provider: 429 kèm
+# Retry-After (thường 30-60s). Backoff đoán mò luôn ngắn hơn → tôn trọng
+# Retry-After của server, chỉ fallback sang exponential khi header thiếu.
+_MAX_ATTEMPTS = 5
+_MAX_SLEEP = 75.0
+
+
+def _retry_after_seconds(exc) -> float | None:
+    """Đọc Retry-After từ response; None nếu server không nói."""
+    response = getattr(exc, "response", None)
+    raw = None
+    if response is not None:
+        raw = (getattr(response, "headers", {}) or {}).get("retry-after")
+        if raw is None:
+            try:
+                meta = (response.json().get("error") or {}).get("metadata") or {}
+                raw = meta.get("retry_after_seconds")
+            except Exception:
+                raw = None
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _create_with_retry(client, **kwargs):
+    from openai import APIConnectionError, APIStatusError, RateLimitError
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except (RateLimitError, APIConnectionError) as exc:
+            last = exc
+        except APIStatusError as exc:
+            if exc.status_code < 500:
+                raise
+            last = exc
+
+        if attempt == _MAX_ATTEMPTS - 1:
+            raise last
+
+        wait = _retry_after_seconds(last)
+        source = "Retry-After"
+        if wait is None:
+            wait, source = min(2**attempt, 8), "backoff"
+        wait = min(wait, _MAX_SLEEP) + random.uniform(0, 0.5)
+        print(
+            f"  [rate limit] chờ {wait:.0f}s ({source}), thử lại "
+            f"{attempt + 2}/{_MAX_ATTEMPTS}...",
+            flush=True,
+        )
+        time.sleep(wait)
+    raise last
+
+
 def _content_to_text(content: Any) -> str:
     if content is None:
         return ""
@@ -192,7 +261,9 @@ def create_blue_pair(
     temperature: float = 0.4,
 ) -> tuple[OpenAIAgent, OpenAIRunner]:
     """Blue Team — always OpenRouter liquid/lfm-2.5-2.6b."""
-    return _make_pair(
+    import os
+
+    pair = _make_pair(
         name=name,
         instruction=instruction,
         app_name=app_name,
@@ -204,6 +275,8 @@ def create_blue_pair(
         output_hooks=output_hooks,
         temperature=temperature,
     )
+    pair[1].min_interval = float(os.environ.get("OPENROUTER_MIN_INTERVAL", "10"))
+    return pair
 
 
 def create_openai_pair(

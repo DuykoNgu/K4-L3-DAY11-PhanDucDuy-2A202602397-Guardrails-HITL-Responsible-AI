@@ -33,10 +33,22 @@ except ImportError:
 PROVIDER_OPENAI = "openai"
 PROVIDER_GEMINI = "gemini"
 PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_OPENCODE = "opencode"
+
+# --- Opencode Go (subscription, endpoint riêng với Zen pay-as-you-go) ---
+# Bật bằng USE_OPENCODE=1 trong .env. Go yêu cầu header x-opencode-session
+# và User-Agent riêng, xem https://opencode.ai/docs/go/#where-can-i-use-it
+OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
+OPENCODE_USER_AGENT = "vinbank-guardrails-lab/1.0"
+# CHỈ dùng cho Red / Red Advance (săn bonus B1/B2).
+# Blue luôn OpenRouter liquid/lfm-2.5-2.6b theo rubric — không đi qua đây.
+OPENCODE_RED_MODEL = "deepseek-v4.1-flash"
 
 # --- Blue Team (LOCKED) ---
 BLUE_PROVIDER = PROVIDER_OPENROUTER
-BLUE_MODEL = "liquid/lfm-2.5-2.6b"
+# OpenRouter chỉ còn route ":free" cho model này — slug trần trả 404
+# "No endpoints found". Override bằng OPENROUTER_MODEL nếu route đổi lại.
+BLUE_MODEL = "liquid/lfm-2.5-2.6b:free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = BLUE_MODEL  # alias
 
@@ -99,13 +111,36 @@ except FileNotFoundError:
 # Blue Team — fixed OpenRouter Liquid
 # ---------------------------------------------------------------------------
 
+def get_opencode_api_key() -> str:
+    return os.environ.get("OPENCODE_API_KEY", "").strip()
+
+
+def opencode_client_kwargs() -> dict:
+    """OpenAI SDK kwargs cho Opencode Go.
+
+    Go từ chối request thiếu ``x-opencode-session`` (400 MissingSessionID) và
+    yêu cầu client tự khai User-Agent thay vì tên SDK.
+    """
+    import uuid
+
+    session = os.environ.get("OPENCODE_SESSION", "").strip() or f"vinbank-lab11-{uuid.uuid4().hex[:12]}"
+    return {
+        "api_key": get_opencode_api_key() or None,
+        "base_url": os.environ.get("OPENCODE_BASE_URL", "").strip() or OPENCODE_GO_BASE_URL,
+        "default_headers": {
+            "x-opencode-session": session,
+            "User-Agent": OPENCODE_USER_AGENT,
+        },
+    }
+
+
 def get_blue_provider() -> str:
     return BLUE_PROVIDER
 
 
 def get_blue_model() -> str:
-    # Hard-locked; env cannot override for the graded Blue Team path.
-    return BLUE_MODEL
+    # Khoá ở liquid/lfm-2.5-2.6b; chỉ cho đổi route (":free") qua env.
+    return os.environ.get("OPENROUTER_MODEL", "").strip() or BLUE_MODEL
 
 
 def get_openrouter_api_key() -> str:
@@ -137,6 +172,8 @@ def get_red_provider() -> str:
         or os.environ.get("LLM_PROVIDER")
         or "openai"
     ).strip().lower()
+    if raw in {"opencode", "opencode-go", "zen"}:
+        return PROVIDER_OPENCODE
     if raw in {"gemini", "google", "adk"}:
         return PROVIDER_GEMINI
     return PROVIDER_OPENAI
@@ -144,7 +181,10 @@ def get_red_provider() -> str:
 
 def get_red_model() -> str:
     """Model Red Team từ .env (cùng cho default + advance)."""
-    if get_red_provider() == PROVIDER_GEMINI:
+    provider = get_red_provider()
+    if provider == PROVIDER_OPENCODE:
+        return os.environ.get("OPENCODE_RED_MODEL", "").strip() or OPENCODE_RED_MODEL
+    if provider == PROVIDER_GEMINI:
         return (
             os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
             or DEFAULT_GEMINI_MODEL
@@ -170,6 +210,8 @@ def get_openai_api_key() -> str:
 
 
 def red_openai_client_kwargs() -> dict:
+    if get_red_provider() == PROVIDER_OPENCODE:
+        return opencode_client_kwargs()
     return {"api_key": get_openai_api_key() or None}
 
 
@@ -180,7 +222,7 @@ def red_provider_label(tier: str = "advance") -> str:
 
 
 def red_uses_openai_sdk() -> bool:
-    return get_red_provider() == PROVIDER_OPENAI
+    return get_red_provider() in {PROVIDER_OPENAI, PROVIDER_OPENCODE}
 
 
 def red_uses_gemini() -> bool:
@@ -244,7 +286,15 @@ def setup_api_key():
 
     red = get_red_provider()
     model = get_red_model()
-    if red == PROVIDER_GEMINI:
+    if red == PROVIDER_OPENCODE:
+        if not get_opencode_api_key():
+            os.environ["OPENCODE_API_KEY"] = input("Enter Opencode API Key (Red): ").strip()
+        print(f"Red / Red Advance  — opencode:{model}")
+        print(
+            "ℹ️  Opencode = đường săn bonus. 10đ leak bắt buộc của CP4 cần model mềm "
+            "mặc định (gpt-4o-mini / gemini-3.5-flash) → chạy thêm 1 lượt với provider đó."
+        )
+    elif red == PROVIDER_GEMINI:
         if not os.environ.get("GOOGLE_API_KEY", "").strip():
             os.environ["GOOGLE_API_KEY"] = input("Enter Google API Key (Red): ").strip()
         os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "0"
